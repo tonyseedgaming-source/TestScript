@@ -20,6 +20,7 @@ from pathlib import Path
 
 
 DEFAULT_BUNDLES_FOLDER = Path(r"D:\SteamLibrary\steamapps\common\Unturned\Bundles")
+DEFAULT_WORKSHOP_FOLDER = Path(r"D:\SteamLibrary\steamapps\workshop\content\304930")
 DEFAULT_OUTPUT_FILE = Path(r"C:\Users\Tony\Documents\UnturnedIDList\UnturnedItems.xlsx")
 DEFAULT_IGNORED_FOLDERS = {"Mythics"}
 
@@ -106,14 +107,17 @@ def contains_item_folders(path: Path, ignored_folders: set[str]) -> bool:
     )
 
 
-def discover_export_folders(bundles_folder: Path, ignored_folders: set[str]) -> list[Path]:
+def discover_export_folders(root_folders: Sequence[Path], ignored_folders: set[str]) -> list[Path]:
     """Find asset category folders that should become worksheets in the export workbook."""
-    if not bundles_folder.exists():
-        print(f"Skipping missing Bundles folder: {bundles_folder}")
-        return []
-
     export_folders: list[Path] = []
-    pending = deque([bundles_folder])
+    pending = deque()
+
+    # Add all root folders to the pending queue
+    for folder in root_folders:
+        if folder.exists():
+            pending.append(folder)
+        else:
+            print(f"Skipping missing folder: {folder}")
 
     while pending:
         current = pending.popleft()
@@ -281,7 +285,7 @@ def collect_item_records(
 
 def collect_selected_asset_records(
     asset_folders: Sequence[Path],
-    bundles_folder: Path,
+    bundles_folders: Sequence[Path],
     ignored_folders: set[str],
 ) -> dict[str, list[ItemRecord]]:
     """Scrape checked asset folders and group them by category."""
@@ -292,7 +296,19 @@ def collect_selected_asset_records(
             continue
 
         parent_folder = folder_path.parent
-        category = category_name(parent_folder, bundles_folder)
+        # Find the right bundles folder to use for category name
+        category = None
+        for bundles_folder in bundles_folders:
+            try:
+                parent_folder.relative_to(bundles_folder)
+                category = category_name(parent_folder, bundles_folder)
+                break
+            except ValueError:
+                continue
+        
+        if category is None:
+            category = parent_folder.name
+        
         record = read_asset_record(folder_path, category)
         if record is None:
             continue
@@ -322,7 +338,7 @@ def append_all_items_sheet(sheet, records: Sequence[ItemRecord]) -> None:
 
 
 def export_workbook(
-    bundles_folder: Path,
+    root_folders: Sequence[Path],
     output_file: Path,
     export_folders: Sequence[Path],
     ignored_folders: set[str],
@@ -339,9 +355,27 @@ def export_workbook(
     records_by_category: dict[str, list[ItemRecord]] = {}
     all_records: list[ItemRecord] = []
 
+    # Use the first root folder as the reference for category names
+    primary_folder = root_folders[0] if root_folders else None
+
     for root_folder in export_folders:
-        records = collect_item_records(root_folder, bundles_folder, ignored_folders)
-        category = category_name(root_folder, bundles_folder)
+        # Find which root folder this export folder belongs to
+        category_ref = primary_folder
+        for root in root_folders:
+            try:
+                root_folder.relative_to(root)
+                category_ref = root
+                break
+            except ValueError:
+                continue
+
+        if category_ref:
+            records = collect_item_records(root_folder, category_ref, ignored_folders)
+            category = category_name(root_folder, category_ref)
+        else:
+            records = []
+            category = root_folder.name
+
         records_by_category[category] = records
         all_records.extend(records)
         print(f"Exported {len(records)} rows from {root_folder}")
@@ -361,7 +395,7 @@ def export_workbook(
 
 
 def export_selected_asset_workbook(
-    bundles_folder: Path,
+    root_folders: Sequence[Path],
     output_file: Path,
     asset_folders: Sequence[Path],
     ignored_folders: set[str],
@@ -376,7 +410,7 @@ def export_selected_asset_workbook(
     summary_sheet.title = "All Items"
     used_titles = {summary_sheet.title}
 
-    records_by_category = collect_selected_asset_records(asset_folders, bundles_folder, ignored_folders)
+    records_by_category = collect_selected_asset_records(asset_folders, root_folders, ignored_folders)
     all_records = [record for records in records_by_category.values() for record in records]
     append_all_items_sheet(summary_sheet, all_records)
 
@@ -398,6 +432,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_BUNDLES_FOLDER,
         help="Path to the Unturned Bundles folder.",
+    )
+    parser.add_argument(
+        "--workshop-folder",
+        type=Path,
+        default=DEFAULT_WORKSHOP_FOLDER,
+        help="Path to the Steam Workshop content folder for Unturned.",
     )
     parser.add_argument(
         "--output-file",
@@ -438,7 +478,7 @@ def ignored_folders_from_args(args: argparse.Namespace) -> set[str]:
     return ignored_folders
 
 
-def launch_gui(default_bundles_folder: Path, default_output_file: Path) -> None:
+def launch_gui(default_bundles_folder: Path, default_workshop_folder: Path, default_output_file: Path) -> None:
     """Launch a small Tkinter app for tree-based scanning and exporting."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -451,9 +491,10 @@ def launch_gui(default_bundles_folder: Path, default_output_file: Path) -> None:
             self.root = root
             self.root.title("Unturned ID Exporter")
             self.bundles_folder = tk.StringVar(value=str(default_bundles_folder))
+            self.workshop_folder = tk.StringVar(value=str(default_workshop_folder))
             self.output_file = tk.StringVar(value=str(default_output_file))
             self.ignore_text = tk.StringVar(value=", ".join(sorted(DEFAULT_IGNORED_FOLDERS)))
-            self.status = tk.StringVar(value="Choose a Bundles folder, then click Scan folders.")
+            self.status = tk.StringVar(value="Choose folders, then click Scan folders.")
             self.node_paths: dict[str, Path] = {}
             self.node_labels: dict[str, str] = {}
             self.asset_nodes: set[str] = set()
@@ -464,22 +505,26 @@ def launch_gui(default_bundles_folder: Path, default_output_file: Path) -> None:
             root.columnconfigure(0, weight=1)
             root.rowconfigure(0, weight=1)
             self.frame.columnconfigure(1, weight=1)
-            self.frame.rowconfigure(4, weight=1)
+            self.frame.rowconfigure(5, weight=1)
 
             ttk.Label(self.frame, text="Bundles folder").grid(row=0, column=0, sticky="w")
             ttk.Entry(self.frame, textvariable=self.bundles_folder).grid(row=0, column=1, sticky="ew")
             ttk.Button(self.frame, text="Browse", command=self.choose_bundles_folder).grid(row=0, column=2)
 
-            ttk.Label(self.frame, text="Output XLSX").grid(row=1, column=0, sticky="w")
-            ttk.Entry(self.frame, textvariable=self.output_file).grid(row=1, column=1, sticky="ew")
-            ttk.Button(self.frame, text="Save as", command=self.choose_output_file).grid(row=1, column=2)
+            ttk.Label(self.frame, text="Workshop folder").grid(row=1, column=0, sticky="w")
+            ttk.Entry(self.frame, textvariable=self.workshop_folder).grid(row=1, column=1, sticky="ew")
+            ttk.Button(self.frame, text="Browse", command=self.choose_workshop_folder).grid(row=1, column=2)
 
-            ttk.Label(self.frame, text="Ignore folders").grid(row=2, column=0, sticky="w")
-            ttk.Entry(self.frame, textvariable=self.ignore_text).grid(row=2, column=1, sticky="ew")
-            ttk.Label(self.frame, text="Comma-separated").grid(row=2, column=2, sticky="w")
+            ttk.Label(self.frame, text="Output XLSX").grid(row=2, column=0, sticky="w")
+            ttk.Entry(self.frame, textvariable=self.output_file).grid(row=2, column=1, sticky="ew")
+            ttk.Button(self.frame, text="Save as", command=self.choose_output_file).grid(row=2, column=2)
+
+            ttk.Label(self.frame, text="Ignore folders").grid(row=3, column=0, sticky="w")
+            ttk.Entry(self.frame, textvariable=self.ignore_text).grid(row=3, column=1, sticky="ew")
+            ttk.Label(self.frame, text="Comma-separated").grid(row=3, column=2, sticky="w")
 
             self.button_frame = ttk.Frame(self.frame)
-            self.button_frame.grid(row=3, column=0, columnspan=3, sticky="w")
+            self.button_frame.grid(row=4, column=0, columnspan=3, sticky="w")
             ttk.Button(self.button_frame, text="Scan folders", command=self.scan_folders).grid(row=0, column=0)
             ttk.Button(self.button_frame, text="Export checked", command=self.export_checked).grid(row=0, column=1)
             ttk.Button(self.button_frame, text="Check all", command=self.check_all).grid(row=0, column=2)
@@ -488,29 +533,34 @@ def launch_gui(default_bundles_folder: Path, default_output_file: Path) -> None:
             self.tree = ttk.Treeview(self.frame, show="tree", selectmode="browse")
             self.scrollbar = ttk.Scrollbar(self.frame, orient="vertical", command=self.tree.yview)
             self.tree.configure(yscrollcommand=self.scrollbar.set)
-            self.tree.grid(row=4, column=0, columnspan=2, sticky="nsew")
-            self.scrollbar.grid(row=4, column=2, sticky="ns")
+            self.tree.grid(row=5, column=0, columnspan=2, sticky="nsew")
+            self.scrollbar.grid(row=5, column=2, sticky="ns")
             self.tree.bind("<ButtonRelease-1>", self.toggle_clicked_node)
             self.tree.bind("<space>", self.toggle_selected_node)
 
-            ttk.Label(self.frame, textvariable=self.status).grid(row=5, column=0, columnspan=3, sticky="w")
+            ttk.Label(self.frame, textvariable=self.status).grid(row=6, column=0, columnspan=3, sticky="w")
 
         def ignored_folders(self) -> set[str]:
             return normalize_names(self.ignore_text.get().split(","))
 
         def choose_bundles_folder(self) -> None:
-            folder = filedialog.askdirectory(initialdir=self.bundles_folder.get())
+            folder = filedialog.askdirectory(title="Select Bundles folder")
             if folder:
                 self.bundles_folder.set(folder)
 
+        def choose_workshop_folder(self) -> None:
+            folder = filedialog.askdirectory(title="Select Workshop folder")
+            if folder:
+                self.workshop_folder.set(folder)
+
         def choose_output_file(self) -> None:
-            file_name = filedialog.asksaveasfilename(
+            file = filedialog.asksaveasfilename(
+                title="Save XLSX as",
                 defaultextension=".xlsx",
-                filetypes=[("Excel workbook", "*.xlsx")],
-                initialfile=Path(self.output_file.get()).name,
+                filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
             )
-            if file_name:
-                self.output_file.set(file_name)
+            if file:
+                self.output_file.set(file)
 
         def scan_folders(self) -> None:
             self.tree.delete(*self.tree.get_children())
@@ -519,16 +569,26 @@ def launch_gui(default_bundles_folder: Path, default_output_file: Path) -> None:
             self.asset_nodes.clear()
             self.checked_nodes.clear()
 
-            bundles_folder = Path(self.bundles_folder.get())
-            folders = discover_export_folders(bundles_folder, self.ignored_folders())
+            root_folders = [Path(self.bundles_folder.get()), Path(self.workshop_folder.get())]
+            export_folders = discover_export_folders(root_folders, self.ignored_folders())
 
-            for category_folder in folders:
-                category_node = self.insert_path_nodes(category_folder, bundles_folder)
+            for category_folder in export_folders:
+                # Find which root folder this belongs to
+                category_ref = root_folders[0]
+                for root in root_folders:
+                    try:
+                        category_folder.relative_to(root)
+                        category_ref = root
+                        break
+                    except ValueError:
+                        continue
+
+                category_node = self.insert_path_nodes(category_folder, category_ref)
                 for asset_folder in self.asset_folders_for_category(category_folder):
                     asset_node = self.tree.insert(
                         category_node,
                         "end",
-                        text=f"{CHECKED} {asset_folder.name}",
+                        text=f"☑ {asset_folder.name}",
                         open=False,
                     )
                     self.node_paths[asset_node] = asset_folder
@@ -552,7 +612,7 @@ def launch_gui(default_bundles_folder: Path, default_output_file: Path) -> None:
                     parent = existing
                     continue
 
-                node = self.tree.insert(parent, "end", text=f"{CHECKED} {part}", open=True)
+                node = self.tree.insert(parent, "end", text=f"☑ {part}", open=True)
                 self.node_paths[node] = current_path
                 self.node_labels[node] = part
                 self.checked_nodes.add(node)
@@ -645,8 +705,9 @@ def launch_gui(default_bundles_folder: Path, default_output_file: Path) -> None:
                 messagebox.showwarning("Nothing selected", "Scan first, then keep at least one asset checked.")
                 return
 
+            root_folders = [Path(self.bundles_folder.get()), Path(self.workshop_folder.get())]
             row_count = export_selected_asset_workbook(
-                Path(self.bundles_folder.get()),
+                root_folders,
                 Path(self.output_file.get()),
                 selected,
                 self.ignored_folders(),
@@ -663,11 +724,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
 
     if args.gui:
-        launch_gui(args.bundles_folder, args.output_file)
+        launch_gui(args.bundles_folder, args.workshop_folder, args.output_file)
         return
 
+    root_folders = [args.bundles_folder, args.workshop_folder]
     ignored_folders = ignored_folders_from_args(args)
-    export_folders = discover_export_folders(args.bundles_folder, ignored_folders)
+    export_folders = discover_export_folders(root_folders, ignored_folders)
 
     if args.scan_only:
         print("Folders that would be exported:")
@@ -676,7 +738,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"Total: {len(export_folders)}")
         return
 
-    total_rows = export_workbook(args.bundles_folder, args.output_file, export_folders, ignored_folders)
+    total_rows = export_workbook(root_folders, args.output_file, export_folders, ignored_folders)
 
     print("Done!")
     print(f"Exported {total_rows} total items")
