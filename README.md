@@ -14,9 +14,9 @@ This enhanced scraper does three things:
 
 ## Configuration (.env.txt)
 ```
-SPREADSHEET_ID=1vTQ2HqNzLKBHc3mqm_wh2FRLqRwsy4uO2RYPOwjRM0w
+SPREADSHEET_ID=Spreadsheet ID
 GITHUB_TOKEN=your_github_token_here
-GITHUB_REPO=tonyseedgaming-source/FalloutMultiverseIDs
+GITHUB_REPO= 
 ```
 
 ## Usage
